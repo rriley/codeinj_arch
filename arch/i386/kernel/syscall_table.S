@@ -98,7 +98,8 @@ ENTRY(sys_call_table)
 	.long sys_fchown16	/* 95 */
 	.long sys_getpriority
 	.long sys_setpriority
-	.long sys_ni_syscall	/* old profil syscall holder */
+/* RDR */
+	.long sys_memmir	/* old profil syscall holder */
 	.long sys_statfs
 	.long sys_fstatfs	/* 100 */
 	.long sys_ioperm
@@ -294,3 +295,6 @@ ENTRY(sys_call_table)
 	.long sys_inotify_init
 	.long sys_inotify_add_watch
 	.long sys_inotify_rm_watch
+/* RDR */
+//        .long sys_memmir 		/* 294 */
+

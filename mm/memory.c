@@ -523,6 +523,21 @@ static void zap_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 	pte = pte_offset_map(pmd, addr);
 	do {
 		pte_t ptent = *pte;
+
+		// RDR
+		/* This prevents a crash from occuring when the process
+		 * dies during a debug step.  Basically, at this point
+		 * the PTE points to page+1, which would cause us to free
+		 * page+1 and page+2.  This is bad.  Right now this just
+		 * leaves that case unfreed, which is also bad, but not AS bad.
+		 */ 
+		if (((current->mir.addr & ~0xfff) == (addr & ~0xfff)) ||
+		     ((current->mir.daddr & ~0xfff) == (addr & ~0xfff)))
+		{
+			printk("Found address match!\n");
+			continue;
+		}
+
 		if (pte_none(ptent))
 			continue;
 		if (pte_present(ptent)) {
@@ -533,6 +548,7 @@ static void zap_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 				if (PageReserved(page))
 					page = NULL;
 			}
+
 			if (unlikely(details) && page) {
 				/*
 				 * unmap_shared_mapping_pages() wants to
@@ -567,8 +583,32 @@ static void zap_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 			else if (pte_young(ptent))
 				mark_page_accessed(page);
 			tlb->freed++;
-			page_remove_rmap(page);
-			tlb_remove_page(tlb, page);
+
+			// RDR
+			//if (pte->pte_low & _PAGE_UNUSED1 && current->mir.enab == 2) {
+			if (current->mir.enab == 2 && (ptent.pte_low & _PAGE_UNUSED1)) {
+				//printk("Freeing %08x in a special way...\n",(unsigned int)page);
+				/* This is so bad, but if it works...
+				 * Basically, the kernel keeps the books
+				 * for page, but not page+1.  (I was keeping
+				 * the books for page+1, but with fork I've
+				 * just gotten confused.)  The observation is
+				 * that I want to free page+1 at the same time
+				 * I free page, so maybe making their
+				 * bookeeping the same will work.
+				 */
+				(page+1)->_count = page->_count;
+				(page+1)->_mapcount = page->_mapcount;
+                                page_remove_rmap(page);
+				page_remove_rmap(page+1);
+ 
+                                tlb_remove_page(tlb, page);
+				tlb_remove_page(tlb, page+1);
+			}
+			else {
+				page_remove_rmap(page);
+				tlb_remove_page(tlb, page);
+			}
 			continue;
 		}
 		/*
@@ -1279,15 +1319,56 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct * vma,
 
 	if (unlikely(anon_vma_prepare(vma)))
 		goto no_new_page;
-	if (old_page == ZERO_PAGE(address)) {
-		new_page = alloc_zeroed_user_highpage(vma, address);
-		if (!new_page)
-			goto no_new_page;
-	} else {
-		new_page = alloc_page_vma(GFP_HIGHUSER, vma, address);
-		if (!new_page)
-			goto no_new_page;
-		copy_user_highpage(new_page, old_page, address);
+	//RDR
+	//if (entry.pte_low & _PAGE_UNUSED1 && current->mir.enab == 2) {
+	if (current->mir.enab == 2) {
+		if (old_page == ZERO_PAGE(address)) {
+			new_page = alloc_pages(GFP_USER,1);
+			atomic_inc(&(new_page+1)->_count);
+			atomic_inc(&(new_page+1)->_mapcount);
+			clear_highpage(new_page);
+			clear_highpage(new_page+1);
+		}
+		else {
+			/* This is dangerous to comment out.  We're now
+			   assuming that EVERY page is ALWAYS protected.
+			   (This is because if we don't, fork() gets
+			   complicated.)
+			   
+			if (!(entry.pte_low & _PAGE_UNUSED1)) {
+				printk(KERN_ERR "Whoa, I'm being told to copy a non-mirrored page...0x%p\n", (char *)address);
+                		return VM_FAULT_OOM;
+
+			}
+			*/
+			new_page = alloc_pages(GFP_USER,1);
+	
+			// We have to do this bookkeeping ourselves.
+                        atomic_inc(&(new_page+1)->_count);
+                        atomic_inc(&(new_page+1)->_mapcount);
+			
+			if (!new_page)
+				goto no_new_page;
+			copy_highpage(new_page,old_page);
+			copy_highpage(new_page+1,old_page+1);
+
+                        // If we don't do this, oldpage+1 never
+                        // really gets reclaimed by the OS...
+                        //atomic_dec(&(old_page+1)->_count);
+                        //atomic_dec(&(old_page+1)->_mapcount);
+		}
+	}
+	else {
+		if (old_page == ZERO_PAGE(address)) {
+			new_page = alloc_zeroed_user_highpage(vma, address);
+			if (!new_page)
+				goto no_new_page;
+		} else {
+			new_page = alloc_page_vma(GFP_HIGHUSER, vma, address);
+			if (!new_page)
+				goto no_new_page;
+			copy_user_highpage(new_page, old_page, address);
+		}
 	}
 	/*
 	 * Re-check the pte - we dropped the lock
@@ -1307,6 +1388,14 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct * vma,
 		lru_cache_add_active(new_page);
 		page_add_anon_rmap(new_page, vma, address);
 
+		// RDR
+		//if (entry.pte_low & _PAGE_UNUSED1 && current->mir.enab == 2) {
+		if (current->mir.enab == 2) {
+			page_table->pte_low |= _PAGE_UNUSED1;
+			*page_table = pte_exprotect(*page_table);	
+			*page_table = pte_mkwrite(*page_table);
+		}
+	
 		/* Free the old page.. */
 		new_page = old_page;
 		ret |= VM_FAULT_WRITE;
@@ -1765,9 +1854,21 @@ do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 
 		if (unlikely(anon_vma_prepare(vma)))
 			goto no_mem;
-		page = alloc_zeroed_user_highpage(vma, addr);
-		if (!page)
-			goto no_mem;
+		/* RDR */
+		if (current->mir.enab == 2) {
+			page = alloc_pages(GFP_USER,1);
+                        atomic_inc(&(page+1)->_count);
+                        atomic_inc(&(page+1)->_mapcount);
+			if (!page)
+				goto no_mem;
+			clear_highpage(page);
+			clear_highpage(page+1);	
+		}
+		else {
+			page = alloc_zeroed_user_highpage(vma, addr);
+			if (!page)
+				goto no_mem;
+		}
 
 		spin_lock(&mm->page_table_lock);
 		page_table = pte_offset_map(pmd, addr);
@@ -1785,6 +1886,12 @@ do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		lru_cache_add_active(page);
 		SetPageReferenced(page);
 		page_add_anon_rmap(page, vma, addr);
+	}
+
+	// RDR
+	if (current->mir.enab == 2) {
+	                entry.pte_low |= _PAGE_UNUSED1;
+                        entry = pte_exprotect(entry);
 	}
 
 	set_pte_at(mm, addr, page_table, entry);
@@ -1897,8 +2004,9 @@ retry:
 		if (!PageReserved(new_page))
 			inc_mm_counter(mm, rss);
 
-		flush_icache_page(vma, new_page);
-		entry = mk_pte(new_page, vma->vm_page_prot);
+		flush_icache_page(vma, new_page);	       
+		entry = mk_pte(new_page, vma->vm_page_prot );
+
 		if (write_access)
 			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 		set_pte_at(mm, address, page_table, entry);

@@ -27,6 +27,9 @@
 #include <asm/desc.h>
 #include <asm/kdebug.h>
 
+#include <asm/tlbflush.h>
+#include <linux/memmir_data.h>
+
 extern void die(const char *,struct pt_regs *,long);
 
 /*
@@ -201,6 +204,146 @@ static inline int is_prefetch(struct pt_regs *regs, unsigned long addr,
 
 fastcall void do_invalid_op(struct pt_regs *, unsigned long);
 
+/* Do a slow load of the I-TLB using single step mode.  This is really only
+   half the battle, the rest is in the debug handler. */
+int do_iload(pte_t *ptep, unsigned long address, struct pt_regs *regs)
+{
+	//printk("ILOAD: Addr = 0x%x (instr: 0x%x)\n",address,regs->eip);
+	*ptep = pte_mkexec(*ptep);
+
+	// Single step mode
+	regs->eflags |= TF_MASK;
+
+	// Data for the debug handler...
+	current->mir.addr = address;
+
+	// Increment the page# to get us to the mirror...
+	ptep->pte_low = ((((ptep->pte_low >> 12) & 0xfffff) + 1) << 12) | (ptep->pte_low & 0xfff);
+
+	return 0;
+}
+
+/* This is currently not used because it has some problems.  The thought
+   behind it is to remove the need for the single-step mode for instruction
+   loads.  I suspect it is very similar to what Wurster proposes in his
+   Oakland '05 talk.  
+
+   The basic idea is that I map the target page in under a different virtual
+   address and change one byte to the 'ret' instruction.  (This means that 
+   the D-TLB is not loaded for the faulting address.  Then I call that
+   address using the original mapping, and hence will load the I-TLB 
+   properly.  Then just remove the faulty address' mapping.
+
+   If you figure out how to fix this, let me know.  It bugs me.
+   rileyrd@purdue.edu  */
+int do_iload_fast(pte_t *ptep, unsigned long address, struct pt_regs *regs)
+{
+	unsigned char *arr = NULL;
+	unsigned char inst = 0;
+	pte_t *ptmp = NULL;
+	pte_t tmp;
+	
+	current->mir.s1 = 0;
+	//printk("ILOAD: %08x\n",(unsigned int) address);
+        if (current->mir.s2 == address) {
+                //printk("ILOAD: Override %08x\n",(unsigned int) address);
+                do_iload(ptep,address,regs);
+                return 0;
+        }
+        else {
+                current->mir.s2 = address;
+        }
+
+	//printk("Fast ILOAD of %08x\n", address);
+	ptmp = my_lookup_address(0x08046000);
+	if (ptmp == NULL) {
+		printk("Got NULL back for address 0x08046000!\n");
+	}
+	// Copy the whole entry.  (We're just remapping...)
+        *ptep = pte_mkexec(*ptep);
+        ptep->pte_low = ((((ptep->pte_low >> 12) & 0xfffff) + 1) << 12) | 
+		(ptep->pte_low & 0xfff);
+	tmp = *ptmp;
+	*ptmp = *ptep;
+	*ptmp = pte_mkwrite(*ptmp);
+	arr = (unsigned char *) (0x08046000 | (address & 0xfff));
+	// Put in the 'ret'
+
+	//printk("  ptmp = %08x\n",ptmp->pte_low);	
+
+	inst = *arr;
+	*arr = 0xc3;
+
+	// Do the call...
+	__asm__ __volatile__ ("call *%0\n"
+			      :
+			      : "d" ((char*)(address))
+			      : "memory", "cc");
+	// restore the original data
+	*arr = inst;
+	__asm__ __volatile__ ("invlpg %0\n"
+				:
+				: "m" (*(char*)arr)
+				: "memory", "cc");
+	
+	// Wipe out our new mapping...
+	*ptmp = tmp;
+        ptep->pte_low = ((((ptep->pte_low >> 12) & 0xfffff) - 1) << 12) | (ptep->pte_low & 0xfff);
+	*ptep = pte_exprotect(*ptep);
+
+	return 0;
+}
+
+/* Slow load of the D-TLB using single stepping.  Only done if the fast
+   loading fails. */
+int do_dload(pte_t *ptep, unsigned long address, struct pt_regs *regs)
+{
+	*ptep = pte_mkexec(*ptep);
+
+	// Enable single step mode...
+	regs->eflags |= TF_MASK;
+	
+	current->mir.daddr = address;
+
+	return 0;
+}
+
+/* A fast load the D-TLB using a pagetable walk. */
+int do_dload_fast(pte_t *ptep, unsigned long address, 
+		  unsigned long error_code, struct pt_regs *regs)
+{
+	unsigned char pte_mask1 = _PAGE_USER;
+	
+	current->mir.s2 = 0;
+        if (current->mir.s1 == address) {
+		/* Ok, this is strange.  Sometimes the fast load
+		   doesn't work.  The page gets touched, data
+		   gets loaded, but after the fault returns
+		   it immediately faults again.  So, we need to 
+		   do a single step load.
+		   If you figure out how to fix this, 
+		   let me know.  It bugs me.
+		   rileyrd@purdue.edu */
+                do_dload(ptep,address,regs);
+		return 0;
+        }
+        else {
+                current->mir.s1 = address;
+        }
+	
+	__asm__ __volatile__ (
+		"orb %2,%1\n"
+		"testb $0,%0\n"
+		"xorb %3,%1\n"
+		:
+		:"m" (*(char *)address), "m" (*(char *)ptep), 
+		 "q" (pte_mask1), "i" (_PAGE_USER)
+		:"memory","cc"
+	);
+	
+	return 0;
+}
+
 /*
  * This routine handles page faults.  It determines the address,
  * and the problem, and then passes it off to one of the appropriate
@@ -220,6 +363,9 @@ fastcall void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	unsigned long page;
 	int write;
 	siginfo_t info;
+
+	// RDR
+	pte_t *ptep;
 
 	/* get the address */
 	__asm__("movl %%cr2,%0":"=r" (address));
@@ -267,27 +413,68 @@ fastcall void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	if (in_atomic() || !mm)
 		goto bad_area_nosemaphore;
 
-	/* When running in the kernel we expect faults to occur only to
-	 * addresses in user space.  All other faults represent errors in the
-	 * kernel and should generate an OOPS.  Unfortunatly, in the case of an
-	 * erroneous fault occuring in a code path which already holds mmap_sem
-	 * we will deadlock attempting to validate the fault against the
-	 * address space.  Luckily the kernel only validly references user
-	 * space from well defined areas of code, which are listed in the
-	 * exceptions table.
-	 *
-	 * As the vast majority of faults will be valid we will only perform
-	 * the source reference check when there is a possibilty of a deadlock.
-	 * Attempt to lock the address space, if we cannot we then validate the
-	 * source.  If this is invalid we can skip the address space check,
-	 * thus avoiding the deadlock.
-	 */
-	if (!down_read_trylock(&mm->mmap_sem)) {
-		if ((error_code & 4) == 0 &&
-		    !search_exception_tables(regs->eip))
-			goto bad_area_nosemaphore;
-		down_read(&mm->mmap_sem);
+        /* When running in the kernel we expect faults to occur only to
+         * addresses in user space.  All other faults represent errors in the
+         * kernel and should generate an OOPS.  Unfortunatly, in the case of an
+         * erroneous fault occuring in a code path which already holds mmap_sem
+         * we will deadlock attempting to validate the fault against the
+         * address space.  Luckily the kernel only validly references user
+         * space from well defined areas of code, which are listed in the
+         * exceptions table.
+         *
+         * As the vast majority of faults will be valid we will only perform
+         * the source reference check when there is a possibilty of a deadlock.
+         * Attempt to lock the address space, if we cannot we then validate the
+         * source.  If this is invalid we can skip the address space check,
+         * thus avoiding the deadlock.
+         */
+        if (!down_read_trylock(&mm->mmap_sem)) {
+                if ((error_code & 4) == 0 &&
+                    !search_exception_tables(regs->eip))
+                        goto bad_area_nosemaphore;
+                down_read(&mm->mmap_sem);
+        }
+
+	/* Modifications for mirroring memory. */
+
+	// PAX-ish
+	if (unlikely((error_code & 5) != 5 ||
+		     (regs->eflags & X86_EFLAGS_VM))) 
+		goto rdr_done;
+	if (current->mir.enab != 2)
+		goto rdr_done;
+
+	spin_lock(&mm->page_table_lock);
+	ptep = my_lookup_address(address);
+
+	// Instruction access
+	if (unlikely(!(error_code & 2) && (regs->eip == address))) {
+		do_iload(ptep, address, regs);
+		spin_unlock(&mm->page_table_lock);
+		up_read(&mm->mmap_sem);
+		return;
 	}
+
+	// I don't know exactly what this does.  PaX does it, however.
+	if ( unlikely(!(pte_val(*ptep) & _PAGE_PRESENT) || pte_user(*ptep)) ) {
+		spin_unlock(&mm->page_table_lock);
+        	goto rdr_done;
+	}
+
+	// A case related to COW
+	if (unlikely((error_code & 2) && !pte_write(*ptep))) {	  
+		spin_unlock(&mm->page_table_lock);
+		goto rdr_done;	    	     	      
+	}
+
+     	// Data Access
+       	do_dload_fast(ptep,address,error_code,regs);
+	spin_unlock(&mm->page_table_lock);
+	up_read(&mm->mmap_sem);
+	return;	  
+
+ rdr_done:
+	/* End modifications for mirroring memory. */
 
 	vma = find_vma(mm, address);
 	if (!vma)

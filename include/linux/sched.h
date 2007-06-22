@@ -35,6 +35,9 @@
 #include <linux/topology.h>
 #include <linux/seccomp.h>
 
+/* RDR */
+#include <linux/memmir_data.h>
+
 struct exec_domain;
 
 /*
@@ -770,6 +773,10 @@ struct task_struct {
 	int cpuset_mems_generation;
 #endif
 	atomic_t fs_excl;	/* holding fs exclusive resources */
+
+	/* RDR */
+	MMIR mir;
+
 };
 
 static inline pid_t process_group(struct task_struct *tsk)

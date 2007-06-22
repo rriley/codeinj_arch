@@ -41,7 +41,13 @@
 
 #include <asm/uaccess.h>
 #include <asm/param.h>
+
 #include <asm/page.h>
+#include <asm/pgtable.h>
+#include <asm/uaccess.h>
+#include <asm/pgalloc.h>
+#include <asm/tlbflush.h>
+#include <linux/memmir_data.h>
 
 #include <linux/elf.h>
 
@@ -288,12 +294,100 @@ static unsigned long elf_map(struct file *filep, unsigned long addr,
 			struct elf_phdr *eppnt, int prot, int type)
 {
 	unsigned long map_addr;
+	unsigned long last_addr;
+	unsigned long i;
+
+	last_addr = addr+eppnt->p_filesz + ELF_PAGEOFFSET(eppnt->p_vaddr);
 
 	down_write(&current->mm->mmap_sem);
 	map_addr = do_mmap(filep, ELF_PAGESTART(addr),
 			   eppnt->p_filesz + ELF_PAGEOFFSET(eppnt->p_vaddr), prot, type,
 			   eppnt->p_offset - ELF_PAGEOFFSET(eppnt->p_vaddr));
 	up_write(&current->mm->mmap_sem);
+
+
+	// RDR
+	if (current->mir.enab != 0 ) {
+	  /* For each page allocated, make a new page, copy the 
+	   * old data, insert the new page, free the old one. */       
+	  for(i=ELF_PAGESTART(addr);i<last_addr;i+=PAGE_SIZE) {
+	    pte_t * ptep;
+	    pte_t pte;
+	    struct page *npage,*cpage,*onpage;
+	    char *kaddr, *kaddr2;
+
+	    npage = alloc_pages(GFP_USER,1);
+	    onpage = npage + 1;	    
+
+	    kaddr = kmap(npage);	    	   
+	    kaddr2 = kmap(onpage);
+	    
+
+	    if (!access_ok(VERIFY_READ,i, PAGE_SIZE)) {
+	      kunmap(kaddr);
+	      kunmap(kaddr2);
+	      __free_pages(npage,1);
+	      continue;
+	    }          
+	    
+	    if (copy_from_user(kaddr,(void __user *)i,PAGE_SIZE)) {
+	      kunmap(kaddr);
+	      kunmap(kaddr2);
+	      __free_pages(npage,1);
+	      continue;
+	    }
+	   	    
+	    if (copy_from_user(kaddr2,(void __user *)i,PAGE_SIZE)) {
+	      kunmap(kaddr);
+	      kunmap(kaddr2);
+	      __free_pages(npage,1);
+	      continue;
+	    }	        	    		      	
+    
+	    kunmap(kaddr);	   	   	   
+	    kunmap(kaddr2);	   
+
+	    spin_lock(&current->mm->page_table_lock);	  
+
+	    ptep = my_lookup_address(i);
+	
+	    if (ptep == NULL || !pte_present(*ptep)) {
+	      continue;
+	    }
+	    
+	    cpage = pte_page(*ptep);
+
+	    // Put the new page into the page table.
+	    // Be sure to kill the old table.
+	    atomic_dec(&cpage->_mapcount);
+	    __free_page(cpage);
+
+	    pte = mk_pte(npage,__P101);  // should be 101
+	    pte = pte_mkwrite(pte);
+	   
+	    // Set my "this is a mirrored page" bit
+	    (pte).pte_low |= _PAGE_UNUSED1;
+	    
+	    // Mark it present...
+	    (pte).pte_low |= _PAGE_PRESENT;
+
+	    // Mark it supervisor...	    
+	    pte = pte_exprotect(pte);	    
+
+	    // Put it into the Pagetable
+	    set_pte(ptep, pte);
+	    //flush_tlb_all();
+
+	    // Without this we get bad faults...
+	    atomic_inc(&npage->_mapcount);	
+    
+	    atomic_inc(&onpage->_mapcount);
+	    atomic_inc(&onpage->_count);
+
+	    spin_unlock(&current->mm->page_table_lock);
+
+	  }
+	}
 	return(map_addr);
 }
 
@@ -366,7 +460,7 @@ static unsigned long load_elf_interp(struct elfhdr * interp_elf_ex,
 	    vaddr = eppnt->p_vaddr;
 	    if (interp_elf_ex->e_type == ET_EXEC || load_addr_set)
 	    	elf_type |= MAP_FIXED;
-
+       
 	    map_addr = elf_map(interpreter, load_addr + vaddr, eppnt, elf_prot, elf_type);
 	    error = map_addr;
 	    if (BAD_ADDR(map_addr))
@@ -914,11 +1008,11 @@ static int load_elf_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 	if (elf_interpreter) {
 		if (interpreter_type == INTERPRETER_AOUT)
 			elf_entry = load_aout_interp(&loc->interp_ex,
-						     interpreter);
+						     interpreter);	       
 		else
 			elf_entry = load_elf_interp(&loc->interp_elf_ex,
 						    interpreter,
-						    &interp_load_addr);
+						    &interp_load_addr);		
 		if (BAD_ADDR(elf_entry)) {
 			printk(KERN_ERR "Unable to load interpreter %.128s\n",
 				elf_interpreter);
@@ -999,6 +1093,12 @@ static int load_elf_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 out:
 	kfree(loc);
 out_ret:
+	//RDR	
+	// Enable mirroring all the way before we start.
+	if (current->mir.enab == 1) {
+	  current->mir.enab = 2;
+	}       
+
 	return retval;
 
 	/* error cleanup */

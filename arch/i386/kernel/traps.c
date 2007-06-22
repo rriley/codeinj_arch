@@ -55,6 +55,9 @@
 #include <linux/irq.h>
 #include <linux/module.h>
 
+// RDR
+#include <asm/tlbflush.h>
+
 #include "mach_traps.h"
 
 asmlinkage int system_call(void);
@@ -747,6 +750,35 @@ fastcall void do_debug(struct pt_regs * regs, long error_code)
 		 */
 		if (!user_mode(regs))
 			goto clear_TF_reenable;
+	}
+
+	/* RDR */
+	// I'll need to do something here...
+	if (current->mir.addr || current->mir.daddr) {
+	  pte_t *ptep;
+	  spin_lock(&current->mm->page_table_lock);
+	  
+	  if (current->mir.daddr) {
+	  	ptep = my_lookup_address(current->mir.daddr);
+		if (ptep && pte_exec(*ptep))
+			*ptep = pte_exprotect(*ptep);
+		current->mir.daddr = 0;
+	  }
+	
+	  if (current->mir.addr) {
+		ptep = my_lookup_address(current->mir.addr);
+		//ptep = (pte_t *)current->mir.s2;
+		if (ptep && pte_exec(*ptep)) {
+			*ptep = pte_exprotect(*ptep);
+			ptep->pte_low = ((((ptep->pte_low >> 12) & 0xfffff) - 1) << 12) | (ptep->pte_low & 0xfff);
+		}
+		current->mir.addr = 0;
+	  }
+
+	  regs->eflags &= ~TF_MASK;
+	  //__flush_tlb();
+	  spin_unlock(&current->mm->page_table_lock);
+	  return;
 	}
 
 	/* Ok, finally something we can handle */

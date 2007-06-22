@@ -103,7 +103,8 @@
 #define __NR_fchown		 95
 #define __NR_getpriority	 96
 #define __NR_setpriority	 97
-#define __NR_profil		 98
+/* RDR */
+#define __NR_memmir		 98
 #define __NR_statfs		 99
 #define __NR_fstatfs		100
 #define __NR_ioperm		101
@@ -299,6 +300,7 @@
 #define __NR_inotify_init	291
 #define __NR_inotify_add_watch	292
 #define __NR_inotify_rm_watch	293
+//#define __NR_memmir		294
 
 #define NR_syscalls 294
 

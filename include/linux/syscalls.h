@@ -508,5 +508,7 @@ asmlinkage long sys_keyctl(int cmd, unsigned long arg2, unsigned long arg3,
 
 asmlinkage long sys_ioprio_set(int which, int who, int ioprio);
 asmlinkage long sys_ioprio_get(int which, int who);
+/* RDR */
+asmlinkage int sys_memmir(int a, int b);
 
 #endif
